@@ -165,8 +165,6 @@ The MTP head adds ~7% to the train phase (57.3 → 61.3 s/step), easily paid for
 - DAPO on `dapo-math-17k`, 16 prompts x 16 samples/step, `max_generate_length=8192`.
 - 6 steps per arm, run one after the other on the same nodes; means over steps 2–5.
 
-![Rollout time per step, GLM-5.3 with and without MTP speculative decoding](/images/examples/specdecode_glm5p3_rollout_time.png)
-
 | Phase | Baseline | MTP | Speedup |
 |---|---:|---:|---:|
 | **Total step** | **287 s** | **170 s** | **1.68x** |
