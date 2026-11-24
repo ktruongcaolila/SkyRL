@@ -154,12 +154,25 @@ export SKYRL_WORKER_NCCL_TIMEOUT_IN_S=7200 SKYRL_WAIT_UNTIL_INFERENCE_SERVER_HEA
 # vLLM servers above Ray's default worker-port range (10002-19999).
 export SKYRL_VLLM_START_PORT="${SKYRL_VLLM_START_PORT:-20000}"
 export VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=7200
-# Settings SkyRL does not forward to the Ray workers (vLLM KV offload / DSA indexer, DeepEP over EFA) live in an env
-# file that `uv run --env-file` loads and Ray's uv hook replays on every worker. It must be at the same path on
-# every node; append your NCCL / EFA settings, WANDB_API_KEY and HF_TOKEN to it.
-ENV_FILE="${ENV_FILE:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/glm5.3_specdecode.env}"
+# Settings SkyRL does not forward to the Ray workers. The script writes them to an env file next to itself and passes
+# it with `uv run --env-file`, which Ray's uv hook replays on every worker, so keep the checkout at the same path on
+# every node. Add your own NCCL / EFA settings, WANDB_API_KEY and HF_TOKEN with EXTRA_ENV_FILE=/path/to/.env.
+WORKER_ENV_FILE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/.glm5.3_specdecode.env"
+cat > "$WORKER_ENV_FILE" <<'EOF'
+# vLLM engines: host KV through OffloadingConnector, DSA indexer prefill logits buffer, scale-out endpoints.
+VLLM_USE_SIMPLE_KV_OFFLOAD=0
+VLLM_SPARSE_INDEXER_MAX_LOGITS_MB=2048
+VLLM_ENABLE_SCALE_OUT_ENDPOINTS=1
+# Trainer: DeepEP internode (EP16 spans 2 trainer nodes) over EFA through NVSHMEM / libfabric.
+NVSHMEM_REMOTE_TRANSPORT=libfabric
+NVSHMEM_LIBFABRIC_PROVIDER=efa
+NVIDIA_GDRCOPY=enabled
+# Trainer: TransformerEngine fused attention, the backend megatron-core's DSA attention runs on.
+NVTE_FUSED_ATTN=1
+EOF
+if [ -n "${EXTRA_ENV_FILE:-}" ]; then cat "$EXTRA_ENV_FILE" >> "$WORKER_ENV_FILE"; fi
 
-uv run --isolated --extra megatron ${ENV_FILE:+--env-file "$ENV_FILE"} -m examples.train.algorithms.dapo.main_dapo \
+uv run --isolated --extra megatron --env-file "$WORKER_ENV_FILE" -m examples.train.algorithms.dapo.main_dapo \
   data.train_data="['$TRAIN_FILE']" \
   data.val_data="['$TEST_FILE']" \
   trainer.algorithm.advantage_estimator="grpo" \

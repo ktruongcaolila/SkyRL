@@ -45,11 +45,11 @@ bash examples/train/spec_decode/run_search_megatron_mimo_7b_specdecode.sh
 
 **Ray cluster.** Start Ray on all 8 nodes and launch from the head node, as in the [installation docs](https://docs.skyrl.ai/docs/getting-started/installation). Set `RAY_RUNTIME_ENV_HOOK=ray._private.runtime_env.uv_runtime_env_hook.hook` so every worker re-runs `uv run`.
 
-Settings SkyRL does not forward to the workers live in `glm5.3_specdecode.env`, which the script passes with `uv run --env-file` (override it with `ENV_FILE`):
+Settings SkyRL does not forward to the workers are set in the script itself:
 - the vLLM KV-offload and DSA-indexer settings;
 - DeepEP over EFA between the trainer nodes.
 
-Ray replays the file on every worker, so it must be at the same path on every node (a shared checkout). Append your NCCL / EFA settings, `WANDB_API_KEY` and `HF_TOKEN` to it. The checkpoint and data must also be at the same path on every node.
+The script writes them to an env file next to itself and passes it with `uv run --env-file`. Ray replays that on every worker, so keep the checkout at the same path on every node (a shared checkout). Add your NCCL / EFA settings, `WANDB_API_KEY` and `HF_TOKEN` with `EXTRA_ENV_FILE=/path/to/.env`. The checkpoint and data must also be at the same path on every node.
 
 ```bash
 bash examples/train/algorithms/dapo/prepare_dapo_data.sh
