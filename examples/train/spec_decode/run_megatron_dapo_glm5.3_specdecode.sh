@@ -121,6 +121,9 @@ export SKYRL_VLLM_START_PORT="${SKYRL_VLLM_START_PORT:-20000}"
 export SKYRL_WORKER_NCCL_TIMEOUT_IN_S=7200 SKYRL_WAIT_UNTIL_INFERENCE_SERVER_HEALTHY_TIMEOUT_S=10800
 # DeepEP internode (EP16 spans 2 trainer nodes) over EFA.
 export NVSHMEM_REMOTE_TRANSPORT=libfabric NVSHMEM_LIBFABRIC_PROVIDER=efa NVIDIA_GDRCOPY=enabled
+# SkyRL forwards SKYRL_* and a fixed list of variables to the Ray workers, not these: VLLM_USE_SIMPLE_KV_OFFLOAD,
+# VLLM_SPARSE_INDEXER_MAX_LOGITS_MB, VLLM_ENABLE_SCALE_OUT_ENDPOINTS, NVSHMEM_* and NVIDIA_GDRCOPY. On a multi-node
+# cluster, set them in the workers' environment too (e.g. before every `ray start`).
 
 RUN_NAME="${RUN_NAME:-glm5p3_dapo_specdecode_mtp${MTP_ENABLED}_k${MTP_NUM_SPECULATIVE_TOKENS}}"
 
