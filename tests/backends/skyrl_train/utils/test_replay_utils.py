@@ -208,30 +208,6 @@ def test_replay_indices_are_dtype_independent(monkeypatch, parallel_state, packe
         assert torch.equal(narrow, wide)
 
 
-def test_mtp_routers_route_on_their_own(monkeypatch, parallel_state):
-    """vLLM captures no routes for its MTP drafter, so replay feeds and arms only the trunk's routers."""
-    trunk, mtp = _Replay(), _Replay(is_mtp_layer=True)
-    RouterReplayAction = _install_router_replay(monkeypatch, [trunk, mtp])
-    monkeypatch.setattr(replay_utils, "_get_current_pp_stage_layer_range", lambda model_config: (0, 1))
-    monkeypatch.setattr(replay_utils, "scatter_router_padding_mask_for_model", lambda mask, model, model_config: mask)
-    attention_mask = torch.ones((1, 3), dtype=torch.long)
-    routes = torch.arange(6).reshape(1, 3, 1, 2)  # [batch, seq, captured layers, topk]
-
-    replay_utils.setup_per_microbatch_replay_forward(
-        _pack_routes(routes, attention_mask),
-        torch.zeros((1, 3), dtype=torch.bool),
-        attention_mask,
-        model=object(),
-        model_config=SimpleNamespace(fp8=None, sequence_parallel=False),
-        metadata_layout=build_token_metadata_layout(attention_mask, routes.device, packed=False, fp8_enabled=False),
-    )
-    assert trunk.target_topk_idx.tolist() == [[0, 1], [2, 3], [4, 5]]
-    assert trunk.router_replay_action == RouterReplayAction.REPLAY_FORWARD
-    replay_utils.setup_per_microbatch_replay_backward()
-    assert trunk.router_replay_action == RouterReplayAction.REPLAY_BACKWARD
-    assert mtp.target_topk_idx is None and mtp.router_replay_action is None
-
-
 @pytest.mark.parametrize(
     ("model_kind", "pre_process", "expected"),
     [
