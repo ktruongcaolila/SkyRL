@@ -441,6 +441,8 @@ class TestMtpExperts:
         "bridge, n_mtp, moe, hybrid",
         [
             ("glm_moe_dsa.glm5_bridge.GLM5Bridge", 1, True, True),  # the head is model.layers.<num_hidden_layers>
+            # No head: the hybrid stack still puts HF layer n's experts in Megatron layer 2n+1.
+            ("glm_moe_dsa.glm5_bridge.GLM5Bridge", 0, True, True),
             ("deepseek.deepseek_v3_bridge.DeepSeekV3Bridge", 1, True, False),
             ("qwen.qwen3_next_bridge.Qwen3NextBridge", 1, True, False),  # mtp.layers.0, and un-indexed mtp.fc etc.
             ("mimo.mimo_bridge.MimoBridge", 2, False, False),  # model.mtp_layers.<i>: no ".layers."
