@@ -160,21 +160,22 @@ The MTP head adds ~7% to the train phase (57.3 → 61.3 s/step), easily paid for
 `run_megatron_dapo_glm5.3_specdecode.sh` applies the same A/B to GLM-5.3 (753B MoE). See `examples/train/spec_decode/README.md` for the Ray and env-file setup.
 
 **Setup.** 8x8 B200, not colocated: 6 trainer nodes and 2 inference nodes.
-- Training: Megatron `TP=1, CP=16, PP=3, EP=16`, bf16, DeepEP.
+- Training: Megatron `TP=1, CP=16, PP=3, EP=16`, bf16, optimizer state on node-local NVMe.
 - Rollout: 2 vLLM DP8 x EP8 engines with NVFP4 routed experts and an NVFP4 KV cache, weight sync over `sharded_rdt`, depth-4 probabilistic drafting.
 - DAPO on `dapo-math-17k`, 16 prompts x 16 samples/step, `max_generate_length=8192`.
-- 6 steps per arm, run one after the other on the same nodes; means over steps 2–5.
+- `main` plus the MTP training PRs (#2758, #2760, #2762, #2763), from a fresh `uv sync --extra megatron`.
+- 4 steps per arm, run one after the other on the same nodes; means over steps 2–4.
 
 | Phase | Baseline | MTP | Speedup |
 |---|---:|---:|---:|
-| **Total step** | **271 s** | **162 s** | **1.67x** |
-| Rollout | 188 s | 84 s | **2.23x** |
-| Policy train | 51.7 s | 47.1 s | 1.10x |
-| Weight sync | 12.1 s | 12.0 s | 1.00x |
+| **Total step** | **392 s** | **289 s** | **1.36x** |
+| Rollout | 186 s | 79 s | **2.36x** |
+| Policy train | 157 s | 160 s | 0.98x |
+| Weight sync | 11.5 s | 11.6 s | 0.99x |
 
-Rollout is 2.23x faster; at ~69% of the step, that gives a **1.67x step speedup**. The mean accepted length was **3.65 tokens**, with 87.8 / 72.4 / 58.2 / 46.1% acceptance at depth 1 / 2 / 3 / 4. Every step has a response cut at 8,192 tokens, so rollout time is set by that longest sequence; its decode speedup (2.24x) matches the rollout speedup.
+Rollout is 2.36x faster; at ~47% of the step, that gives a **1.36x step speedup**. The mean accepted length was **3.66 tokens**, with 88.3 / 73.0 / 58.7 / 46.3% acceptance at depth 1 / 2 / 3 / 4. Every step has a response cut at 8,192 tokens, so rollout time is set by that longest sequence; its decode speedup (2.37x) matches the rollout speedup.
 
-**No effect on policy training.** Policy train time varies by about ±10 s between runs at these steps. Reward and the rollout/trainer log-prob gap are similar in both arms (one run each, over steps 2-5): 0.22 vs 0.22 raw reward, 0.069 vs 0.069 mean |log-prob diff|.
+**No effect on policy training.** Reward and the rollout/trainer log-prob gap are similar in both arms (one run each, over steps 2-4): 0.20 vs 0.18 raw reward, 0.071 vs 0.071 mean |log-prob diff|.
 
 ## What's Next
 

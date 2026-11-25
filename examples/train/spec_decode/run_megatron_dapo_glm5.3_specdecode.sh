@@ -60,25 +60,26 @@ ENFORCE_EAGER=false # FULL_DECODE_ONLY CUDA graphs (capture sizes in the MTP blo
 LR=1e-6
 
 # megatron config -- GLM-5.3 is a 753B MoE (~725B in 256 routed experts per layer, ~28B dense).
-# bf16 weights + bf16 grads are ~3 TB, so the trainer needs 48 GPUs: TP1 / CP16 / PP3 / EP16 puts ~15B expert
-# and ~9B dense params on each GPU (~100 GB/GPU with grads, before activations). With 4 trainer nodes (EP8 / PP4)
-# it is ~120 GB/GPU and model init runs out of memory. CP16 shards the DSA indexer, which TP would replicate;
-# EP16 spans 2 nodes (DeepEP over EFA). PP3 at 26/28/24 layers: every stage starts on a layer that computes its
-# own DSA top-k (index_topk_freq 4).
+# bf16 weights + fp32 grads are ~4.5 TB, so the trainer needs 48 GPUs: TP1 / CP16 / PP3 / EP16 puts ~15B expert
+# and ~9B dense params on each GPU (~105 GB/GPU with grads, before activations). With 4 trainer nodes (EP8 / PP4)
+# model init runs out of memory. CP16 shards the DSA indexer, which TP would replicate; EP16 spans 2 nodes. PP3 at
+# 26/28/24 layers: every stage starts on a layer that computes its own DSA top-k (index_topk_freq 4).
 MEGATRON_TP=1
 MEGATRON_PP=3
 MEGATRON_CP=16
 MEGATRON_EP=16
 MEGATRON_ETP=1
 HYBRID_LAYER_PATTERN="D-D-D-$(printf 'DE%.0s' {1..23})|$(printf 'DE%.0s' {1..28})|$(printf 'DE%.0s' {1..24})"
-# One 10K sequence per CP rank group at a time is far below this; packs ~6 sequences per microbatch.
-MAX_TOKENS_PER_MICROBATCH=65536
+# Packs ~3 sequences per microbatch. Under full recompute, Megatron-Bridge's GLM-5 stack replays a whole pipeline
+# stage at once in the backward, so the activations of all of a stage's layers are live together: with fp32 grads,
+# 65536 runs out of memory in the first step, and 32768 peaks at ~147 GB/GPU.
+MAX_TOKENS_PER_MICROBATCH=32768
 
-# optimizer offload -- ON. The optimizer step runs on the host with cpu_adamw_bf16 (bf16 moments, fp32 master as
-# bf16 weight + int16 remainder: 6 B/param, ~750 GB per trainer node). Megatron's fp32 HybridDeviceOptimizer
-# state (12 B/param plus fp32 grad copies) does not fit 6 nodes' host memory.
-OPTIMIZER_OFFLOAD=true
-OPTIMIZER_OFFLOAD_FRACTION=1.0
+# optimizer state on node-local disk: fp32 master params and bf16 Adam moments (8 B/param, ~1.1 TB on the busiest
+# trainer node), streamed through the GPU one chunk at a time in the optimizer step. Megatron's CPU-offloaded Adam
+# would keep fp32 master, fp32 moments and fp32 grads in host RAM (16 B/param, ~2.2 TB on the busiest node), more
+# than the hosts have. Point OPTIMIZER_STATE_DIR at fast node-local NVMe on every trainer node.
+OPTIMIZER_STATE_DIR="${OPTIMIZER_STATE_DIR:-/mnt/local_storage/skyrl_optimizer_state}"
 
 # TIS parameters
 TIS_IMP_RATIO_CAP=2.0
@@ -110,9 +111,8 @@ fi
 
 # GLM-5.3 flags
 # Trainer: DSA sparse attention on cuDNN/FlashMLA with the TileLang indexer top-k; no indexer loss, so megatron-core
-# freezes the indexer. The CP layout is built once per microbatch instead of in every DSA layer, which here cuts the
-# trainer's forward/backward time by about a quarter.
-export SKYRL_DSA_INDEXER_BACKEND=tilelang SKYRL_DSA_CP_LAYOUT_CACHE=1
+# freezes the indexer.
+export SKYRL_DSA_INDEXER_BACKEND=tilelang
 # Inference: NVFP4 routed experts, re-quantized online from the bf16 weights on every sync (W4A4 with per-token
 # activation scales); other layers stay bf16. NVFP4 KV cache. NVLink one-sided expert all-to-all (each engine's EP
 # group is one node). sparse_mla_force_mqa keeps prefill on sparse MLA's MQA path: the default MHA prefill path
@@ -124,25 +124,19 @@ ENGINE_INIT_KWARGS='{
   "all2all_backend": "flashinfer_nvlink_one_sided", "enable_ep_weight_filter": true,
   "attention_config": {"sparse_mla_force_mqa": true},
   "compilation_config": {"cudagraph_mode": "FULL_DECODE_ONLY", "cudagraph_capture_sizes": '"$CUDAGRAPH_CAPTURE_SIZES"'}}'
-# DeepEP for the flex dispatcher (the bridge defaults to HybridEP). No DSA indexer loss (the bridge's 0.001 would run
-# the indexer KL loss every step).
+# No DSA indexer loss (the bridge's 0.001 would run the indexer KL loss every step).
 TRANSFORMER_CONFIG_KWARGS='{
-  "moe_flex_dispatcher_backend": "deepep",
   "dsa_kernel_backend": "cudnn", "dsa_indexer_loss_coeff": 0.0,
   "hybrid_layer_pattern": "'"$HYBRID_LAYER_PATTERN"'"}'
 DISTRIBUTED_EXECUTOR_BACKEND="ray"
 # The router sends each trajectory to the least-loaded engine DP rank (16 per rank). SkyRL's default hashes the session
 # id, which spreads them unevenly; rollouts were ~3% slower with it.
 ROUTER_POLICY=sticky_least_loaded
-# Settings SkyRL does not forward to the Ray workers. The script writes them to an env file next to itself and passes
-# it with `uv run --env-file`, which Ray's uv hook replays on every worker, so keep the checkout at the same path on
-# every node. Add your own NCCL / EFA settings, WANDB_API_KEY and HF_TOKEN with EXTRA_ENV_FILE=/path/to/.env.
+# Settings SkyRL does not forward to the Ray workers (your NCCL / EFA settings, WANDB_API_KEY, HF_TOKEN) go in
+# EXTRA_ENV_FILE=/path/to/.env. The script copies it to an env file next to itself and passes that with
+# `uv run --env-file`, which Ray's uv hook replays on every worker, so keep the checkout at the same path on every node.
 WORKER_ENV_FILE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/.glm5.3_specdecode.env"
-cat > "$WORKER_ENV_FILE" <<'EOF'
-# DeepEP across trainer nodes (EP16 spans 2 nodes) on EFA clusters; leave unset on InfiniBand
-NVSHMEM_REMOTE_TRANSPORT=libfabric
-NVSHMEM_LIBFABRIC_PROVIDER=efa
-EOF
+: > "$WORKER_ENV_FILE"
 if [ -n "${EXTRA_ENV_FILE:-}" ]; then cat "$EXTRA_ENV_FILE" >> "$WORKER_ENV_FILE"; fi
 
 uv run --isolated --extra megatron --env-file "$WORKER_ENV_FILE" -m examples.train.algorithms.dapo.main_dapo \
@@ -179,19 +173,10 @@ uv run --isolated --extra megatron --env-file "$WORKER_ENV_FILE" -m examples.tra
   trainer.policy.megatron_config.context_parallel_size=$MEGATRON_CP \
   trainer.policy.megatron_config.expert_model_parallel_size=$MEGATRON_EP \
   trainer.policy.megatron_config.expert_tensor_parallel_size=$MEGATRON_ETP \
-  trainer.policy.megatron_config.moe_token_dispatcher_type=flex \
-  trainer.policy.megatron_config.ddp_config.grad_reduce_in_fp32=false \
   trainer.policy.megatron_config.transformer_config_kwargs="$TRANSFORMER_CONFIG_KWARGS" \
   trainer.policy.megatron_config.mtp_num_layers=1 \
-  trainer.policy.optimizer_config.name=cpu_adamw_bf16 \
-  trainer.policy.megatron_config.optimizer_config_kwargs.overlap_cpu_optimizer_d2h_h2d=$OPTIMIZER_OFFLOAD \
-  trainer.policy.megatron_config.optimizer_config_kwargs.use_precision_aware_optimizer=$OPTIMIZER_OFFLOAD \
-  trainer.policy.megatron_config.optimizer_config_kwargs.optimizer_cpu_offload=$OPTIMIZER_OFFLOAD \
-  trainer.policy.megatron_config.optimizer_config_kwargs.optimizer_offload_fraction=$OPTIMIZER_OFFLOAD_FRACTION \
-  trainer.policy.megatron_config.optimizer_config_kwargs.exp_avg_dtype=bf16 \
-  trainer.policy.megatron_config.optimizer_config_kwargs.exp_avg_sq_dtype=bf16 \
-  trainer.policy.megatron_config.optimizer_config_kwargs.main_params_dtype=fp32 \
-  trainer.policy.megatron_config.optimizer_config_kwargs.store_param_remainders=true \
+  trainer.policy.megatron_config.optimizer_offload_to_disk.dir="$OPTIMIZER_STATE_DIR" \
+  trainer.policy.megatron_config.optimizer_offload_to_disk.moment_storage_dtype=bf16 \
   trainer.algorithm.off_policy_correction.tis_ratio_type=$TIS_TYPE \
   trainer.algorithm.off_policy_correction.token_tis_ratio_clip_high=$TIS_IMP_RATIO_CAP \
   trainer.fused_lm_head_logprob=true \
