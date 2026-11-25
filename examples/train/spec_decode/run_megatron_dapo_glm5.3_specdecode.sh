@@ -17,8 +17,8 @@ NUM_GPUS_PER_NODE=8
 # Inference: 2 nodes, one vLLM engine per node, each 8 data-parallel attention ranks sharing 8-way expert
 # parallelism (DP8 x EP8, 1 GPU per rank). One node holds a whole engine only because the routed experts are
 # NVFP4: ~725B expert params at ~4.5 bits are ~51 GB/GPU under EP8, and with the bf16 attention / dense weights
-# that every DP rank keeps a GPU loads 87 GiB. That leaves 1.1M (MTP) to 1.4M tokens of NVFP4 KV per rank at
-# gpu_memory_utilization=0.77, against the 16 x 10K tokens a rank holds per step. bf16 experts alone would be
+# that every DP rank keeps a GPU loads 86-87 GiB. That leaves over 1M tokens of NVFP4 KV per rank at vLLM's
+# default gpu_memory_utilization, against the 16 x 10K tokens a rank holds per step. bf16 experts alone would be
 # ~181 GB/GPU and FP8 ~91 GB/GPU.
 # Two engines = 16 DP ranks = 16 sequences per rank at the start of each rollout (256 per step), where MTP
 # helps most; more engines would lower that further but cost nodes.
@@ -87,11 +87,11 @@ TIS_TYPE=token
 
 # Multi-Token Prediction (MTP) speculative decoding.
 # GLM-5.3 ships 1 native MTP layer (`num_nextn_predict_layers: 1`, layer 78), but Megatron-Bridge's GLM5 bridge
-# builds none unless mtp_num_layers=1 is set. NUM_SPECULATIVE_TOKENS is the vLLM *draft depth* only -- values > 1
-# reuse the single layer autoregressively at draft time. Here k=4, with probabilistic drafting: each draft token
-# is sampled from the head's distribution instead of its argmax. Verification is still vLLM's exact rejection
-# sampler, so this is lossless; it raises acceptance at temperature 1. vLLM re-quantizes the drafter's experts to
-# NVFP4 like the target's.
+# builds none unless mtp_num_layers=1 is set (the baseline ignores it: trainer.mtp.enabled=false builds no head).
+# NUM_SPECULATIVE_TOKENS is the vLLM *draft depth* only -- values > 1 reuse the single layer autoregressively at
+# draft time. Here k=4, with probabilistic drafting: each draft token is sampled from the head's distribution
+# instead of its argmax. Verification is still vLLM's exact rejection sampler, so this is lossless; it raises
+# acceptance at temperature 1. vLLM re-quantizes the drafter's experts to NVFP4 like the target's.
 MTP_ENABLED="${MTP_ENABLED:-true}"
 MTP_NUM_SPECULATIVE_TOKENS=4
 MTP_DRAFT_SAMPLE_METHOD=probabilistic
@@ -99,76 +99,49 @@ MTP_DRAFT_SAMPLE_METHOD=probabilistic
 # NOTE: the draft loss trains ONLY the MTP-head params -- trunk, re-embedding and output weight are detached.
 MTP_LOSS_WEIGHT=0.1
 if [ "$MTP_ENABLED" = "true" ]; then
-  MTP_NUM_LAYERS=1
   SPECULATIVE_CONFIG='{"method": "mtp", "num_speculative_tokens": '"$MTP_NUM_SPECULATIVE_TOKENS"', "draft_sample_method": "'"$MTP_DRAFT_SAMPLE_METHOD"'"}'
   # MTP verifies k+1 tokens per sequence: capture decode graphs up to max_num_seqs * (k+1) tokens.
   CUDAGRAPH_CAPTURE_SIZES="[1, 2, 4, 8, 16, 32, 64, 128, 160, 320, 640]"
 else
-  MTP_NUM_LAYERS=0
   SPECULATIVE_CONFIG=null
   CUDAGRAPH_CAPTURE_SIZES="[1, 2, 4, 8, 16, 32, 64, 128]"
 fi
 
 
 # GLM-5.3 flags
-# Trainer: DSA sparse attention on cuDNN/FlashMLA with the TileLang indexer top-k; reuse the forward top-k in the
-# recompute (exact: the indexer is frozen), parallel TileLang logits writes, FP8 indexer scoring as in vLLM.
-export SKYRL_DSA_INDEXER_BACKEND=tilelang SKYRL_DSA_TOPK_REUSE=1 SKYRL_DSA_INDEXER_PARALLEL_WRITE=1 SKYRL_DSA_INDEXER_FP8=1
-export SKYRL_DSA_CP_LAYOUT_CACHE=1 SKYRL_DISABLE_FA4=1
-# Full-recompute checkpoint inputs wait in pinned host memory; attention gets its own checkpoint inside MoE layers.
-export SKYRL_OFFLOAD_CHECKPOINT_INPUTS=1 SKYRL_OFFLOAD_CHECKPOINT_INPUTS_PINNED=1 SKYRL_MOE_ATTENTION_RECOMPUTE=1
-# Frozen weights (the DSA indexer) offload to file-backed pages in a writable node-local directory.
-export SKYRL_FROZEN_OFFLOAD_DIR="${SKYRL_FROZEN_OFFLOAD_DIR:-/mnt/local_storage/skyrl_frozen_offload}"
-# Inference: NVFP4 routed experts, re-quantized online from the bf16 weights on every sync (W4A4, per-token
-# activation scales, FlashInfer TRT-LLM, round-to-nearest with 4/6 block scales); other layers stay bf16. NVFP4
-# KV cache on FlashMLA sparse attention. NVLink one-sided expert all-to-all (each engine's EP group is one node).
-# The engines boot from the real checkpoint, so the MTP drafter has its weights before the first sync.
-export SKYRL_NVFP4_ROUNDING=nearest SKYRL_NVFP4_BLOCK_SCALE=four_over_six SKYRL_NVFP4_STOCHASTIC_STRENGTH=1.0
+# Trainer: DSA sparse attention on cuDNN/FlashMLA with the TileLang indexer top-k; no indexer loss, so megatron-core
+# freezes the indexer. The CP layout is built once per microbatch instead of in every DSA layer, which here cuts the
+# trainer's forward/backward time by about a quarter.
+export SKYRL_DSA_INDEXER_BACKEND=tilelang SKYRL_DSA_CP_LAYOUT_CACHE=1
+# Inference: NVFP4 routed experts, re-quantized online from the bf16 weights on every sync (W4A4 with per-token
+# activation scales); other layers stay bf16. NVFP4 KV cache. NVLink one-sided expert all-to-all (each engine's EP
+# group is one node). sparse_mla_force_mqa keeps prefill on sparse MLA's MQA path: the default MHA prefill path
+# cannot read an NVFP4 KV cache. The engines boot from the real checkpoint, so the MTP drafter has its weights before
+# the first sync; with enable_ep_weight_filter each rank reads only its own experts.
 ENGINE_INIT_KWARGS='{
-  "max_model_len": '"$MAX_SEQ_LEN"', "trust_remote_code": true, "logprobs_mode": "processed_logprobs", "load_format": "auto",
-  "quantization": "nvfp4_per_token", "kv_cache_dtype": "nvfp4_ds_mla", "block_size": 64,
-  "async_scheduling": false, "prefill_schedule_interval": 4,
-  "all2all_backend": "flashinfer_nvlink_one_sided", "enable_eplb": false, "enable_ep_weight_filter": true,
-  "kv_offloading_backend": "native", "kv_offloading_size": 96,
-  "attention_config": {"backend": "FLASHMLA_SPARSE", "sparse_mla_force_mqa": true, "mla_prefill_backend": null,
-                       "sparse_mla_prefill_workspace_factor": 2},
-  "kernel_config": {"moe_backend": "flashinfer_trtllm",
-                    "ir_op_priority": {"rms_norm": ["vllm_c"], "fused_add_rms_norm": ["vllm_c"]}},
-  "compilation_config": {"cudagraph_mode": "FULL_DECODE_ONLY", "cudagraph_capture_sizes": '"$CUDAGRAPH_CAPTURE_SIZES"',
-                         "cudagraph_num_of_warmups": 1, "pass_config": {"fuse_allreduce_rms": false}}}'
+  "max_model_len": '"$MAX_SEQ_LEN"',
+  "quantization": "nvfp4_per_token", "kv_cache_dtype": "nvfp4_ds_mla",
+  "all2all_backend": "flashinfer_nvlink_one_sided", "enable_ep_weight_filter": true,
+  "attention_config": {"sparse_mla_force_mqa": true},
+  "compilation_config": {"cudagraph_mode": "FULL_DECODE_ONLY", "cudagraph_capture_sizes": '"$CUDAGRAPH_CAPTURE_SIZES"'}}'
+# DeepEP for the flex dispatcher (the bridge defaults to HybridEP). No DSA indexer loss (the bridge's 0.001 would run
+# the indexer KL loss every step).
 TRANSFORMER_CONFIG_KWARGS='{
-  "recompute_granularity": "full", "recompute_method": "uniform", "recompute_num_layers": 1, "recompute_modules": null,
-  "gradient_accumulation_fusion": false, "mlp_chunks_for_training": 1, "deallocate_pipeline_outputs": true,
-  "moe_aux_loss_coeff": 0.0, "moe_permute_fusion": true, "moe_router_fusion": false, "moe_router_bias_update_rate": 0.0,
-  "moe_router_dtype": "fp32", "moe_router_pre_softmax": true, "moe_router_topk_scaling_factor": 2.5,
-  "moe_flex_dispatcher_backend": "deepep", "moe_deepep_num_sms": 20, "moe_shared_expert_overlap": false,
-  "dsa_kernel_backend": "cudnn", "dsa_indexer_loss_coeff": 0.0, "dsa_indexer_topk_freq": 4, "dsa_indexer_skip_topk_offset": 3,
-  "apply_rope_fusion": false, "bias_activation_fusion": true, "defer_fp32_logits": true, "mtp_num_layers": '"$MTP_NUM_LAYERS"',
-  "pipeline_model_parallel_layout": null, "hybrid_layer_pattern": "'"$HYBRID_LAYER_PATTERN"'"}'
-# sharded_rdt: the engines pull their own shards from the trainer (the drafter rides the target's sessions);
-# tile pulls of tensors above 1.125 GiB (embedding / LM head) instead of failing planning.
-export SKYRL_RDT_SPLIT_OVERSIZED_ROWS=1 SKYRL_RDT_MAX_PULL_GB=1.125
+  "moe_flex_dispatcher_backend": "deepep",
+  "dsa_kernel_backend": "cudnn", "dsa_indexer_loss_coeff": 0.0,
+  "hybrid_layer_pattern": "'"$HYBRID_LAYER_PATTERN"'"}'
 DISTRIBUTED_EXECUTOR_BACKEND="ray"
-export OMP_NUM_THREADS=12 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False
-export SKYRL_WORKER_NCCL_TIMEOUT_IN_S=7200 SKYRL_WAIT_UNTIL_INFERENCE_SERVER_HEALTHY_TIMEOUT_S=10800
-# vLLM servers above Ray's default worker-port range (10002-19999).
-export SKYRL_VLLM_START_PORT="${SKYRL_VLLM_START_PORT:-20000}"
-export VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=7200
+# The router sends each trajectory to the least-loaded engine DP rank (16 per rank). SkyRL's default hashes the session
+# id, which spreads them unevenly; rollouts were ~3% slower with it.
+ROUTER_POLICY=sticky_least_loaded
 # Settings SkyRL does not forward to the Ray workers. The script writes them to an env file next to itself and passes
 # it with `uv run --env-file`, which Ray's uv hook replays on every worker, so keep the checkout at the same path on
 # every node. Add your own NCCL / EFA settings, WANDB_API_KEY and HF_TOKEN with EXTRA_ENV_FILE=/path/to/.env.
 WORKER_ENV_FILE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/.glm5.3_specdecode.env"
 cat > "$WORKER_ENV_FILE" <<'EOF'
-# vLLM engines: host KV through OffloadingConnector, DSA indexer prefill logits buffer, scale-out endpoints.
-VLLM_USE_SIMPLE_KV_OFFLOAD=0
-VLLM_SPARSE_INDEXER_MAX_LOGITS_MB=2048
-VLLM_ENABLE_SCALE_OUT_ENDPOINTS=1
-# Trainer: DeepEP internode (EP16 spans 2 trainer nodes) over EFA through NVSHMEM / libfabric.
+# DeepEP across trainer nodes (EP16 spans 2 nodes) on EFA clusters; leave unset on InfiniBand
 NVSHMEM_REMOTE_TRANSPORT=libfabric
 NVSHMEM_LIBFABRIC_PROVIDER=efa
-NVIDIA_GDRCOPY=enabled
-# Trainer: TransformerEngine fused attention, the backend megatron-core's DSA attention runs on.
-NVTE_FUSED_ATTN=1
 EOF
 if [ -n "${EXTRA_ENV_FILE:-}" ]; then cat "$EXTRA_ENV_FILE" >> "$WORKER_ENV_FILE"; fi
 
@@ -191,14 +164,8 @@ uv run --isolated --extra megatron --env-file "$WORKER_ENV_FILE" -m examples.tra
   generator.eval_sampling_params.max_generate_length=$MAX_RESPONSE_LENGTH \
   trainer.algorithm.use_kl_loss=$USE_KL_LOSS \
   trainer.algorithm.clip_ratio_c=$CLIP_RATIO_C \
-  trainer.algorithm.max_seq_len=$MAX_SEQ_LEN \
   trainer.policy.model.path="$MODEL_NAME" \
-  trainer.policy.language_model_only=true \
   trainer.placement.colocate_all=false \
-  trainer.placement.colocate_policy_ref=false \
-  trainer.placement.ref_num_nodes=0 \
-  trainer.placement.ref_num_gpus_per_node=0 \
-  trainer.placement.critic_num_nodes=0 \
   trainer.strategy=megatron \
   generator.inference_engine.distributed_executor_backend="$DISTRIBUTED_EXECUTOR_BACKEND" \
   trainer.placement.policy_num_nodes=$NUM_NODES \
@@ -213,24 +180,14 @@ uv run --isolated --extra megatron --env-file "$WORKER_ENV_FILE" -m examples.tra
   trainer.policy.megatron_config.expert_model_parallel_size=$MEGATRON_EP \
   trainer.policy.megatron_config.expert_tensor_parallel_size=$MEGATRON_ETP \
   trainer.policy.megatron_config.moe_token_dispatcher_type=flex \
-  trainer.policy.megatron_config.moe_router_load_balancing_type=none \
-  trainer.policy.megatron_config.moe_router_score_function=sigmoid \
-  trainer.policy.megatron_config.moe_router_enable_expert_bias=true \
-  trainer.policy.megatron_config.moe_grouped_gemm=true \
-  trainer.policy.megatron_config.freeze_dsa_indexer=true \
-  trainer.policy.megatron_config.empty_cuda_cache=false \
   trainer.policy.megatron_config.ddp_config.grad_reduce_in_fp32=false \
   trainer.policy.megatron_config.transformer_config_kwargs="$TRANSFORMER_CONFIG_KWARGS" \
-  trainer.policy.megatron_config.mtp_num_layers=$MTP_NUM_LAYERS \
-  "trainer.policy.megatron_config.model_config_kwargs={\"model_config\": {\"num_nextn_predict_layers\": $MTP_NUM_LAYERS}}" \
+  trainer.policy.megatron_config.mtp_num_layers=1 \
   trainer.policy.optimizer_config.name=cpu_adamw_bf16 \
-  "trainer.policy.optimizer_config.kwargs={\"num_threads\": 20}" \
   trainer.policy.megatron_config.optimizer_config_kwargs.overlap_cpu_optimizer_d2h_h2d=$OPTIMIZER_OFFLOAD \
   trainer.policy.megatron_config.optimizer_config_kwargs.use_precision_aware_optimizer=$OPTIMIZER_OFFLOAD \
   trainer.policy.megatron_config.optimizer_config_kwargs.optimizer_cpu_offload=$OPTIMIZER_OFFLOAD \
   trainer.policy.megatron_config.optimizer_config_kwargs.optimizer_offload_fraction=$OPTIMIZER_OFFLOAD_FRACTION \
-  trainer.policy.megatron_config.optimizer_config_kwargs.pin_cpu_grads=true \
-  trainer.policy.megatron_config.optimizer_config_kwargs.pin_cpu_params=true \
   trainer.policy.megatron_config.optimizer_config_kwargs.exp_avg_dtype=bf16 \
   trainer.policy.megatron_config.optimizer_config_kwargs.exp_avg_sq_dtype=bf16 \
   trainer.policy.megatron_config.optimizer_config_kwargs.main_params_dtype=fp32 \
@@ -239,7 +196,6 @@ uv run --isolated --extra megatron --env-file "$WORKER_ENV_FILE" -m examples.tra
   trainer.algorithm.off_policy_correction.token_tis_ratio_clip_high=$TIS_IMP_RATIO_CAP \
   trainer.fused_lm_head_logprob=true \
   trainer.fused_lm_head_logprob_backend=triton \
-  trainer.flash_attn=false \
   trainer.remove_microbatch_padding=true \
   trainer.max_tokens_per_microbatch=$MAX_TOKENS_PER_MICROBATCH \
   trainer.epochs=10 \
@@ -263,22 +219,15 @@ uv run --isolated --extra megatron --env-file "$WORKER_ENV_FILE" -m examples.tra
   generator.inference_engine.backend=vllm \
   generator.inference_engine.run_engines_locally=true \
   generator.inference_engine.weight_sync_backend=sharded_rdt \
-  generator.inference_engine.use_expandable_segments=false \
   generator.inference_engine.async_engine=true \
-  generator.inference_engine.language_model_only=true \
-  generator.inference_engine.served_model_name=GLM-5.3 \
   generator.inference_engine.max_num_seqs=128 \
-  generator.inference_engine.max_num_batched_tokens=8192 \
-  generator.inference_engine.nvfp4_online_quant.rounding=nearest \
-  generator.inference_engine.nvfp4_online_quant.block_scale=four_over_six \
-  "generator.inference_engine.router_init_kwargs={\"policy\": \"sticky_least_loaded\", \"request_timeout_secs\": 5700}" \
+  generator.inference_engine.router_init_kwargs.policy=$ROUTER_POLICY \
   generator.inference_engine.engine_init_kwargs="$ENGINE_INIT_KWARGS" \
   generator.inference_engine.speculative_config="$SPECULATIVE_CONFIG" \
   generator.batched=false \
   environment.env_class=aime \
   generator.n_samples_per_prompt=$N_SAMPLES_PER_PROMPT \
   generator.eval_n_samples_per_prompt=$EVAL_N_SAMPLES_PER_PROMPT \
-  generator.inference_engine.gpu_memory_utilization=0.77 \
   trainer.mtp.enabled=$MTP_ENABLED \
   trainer.mtp.num_speculative_tokens=$MTP_NUM_SPECULATIVE_TOKENS \
   trainer.mtp.loss_weight=$MTP_LOSS_WEIGHT \

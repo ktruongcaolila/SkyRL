@@ -167,14 +167,14 @@ The MTP head adds ~7% to the train phase (57.3 → 61.3 s/step), easily paid for
 
 | Phase | Baseline | MTP | Speedup |
 |---|---:|---:|---:|
-| **Total step** | **287 s** | **170 s** | **1.68x** |
-| Rollout | 205 s | 81 s | **2.51x** |
-| Policy train | 53.4 s | 58.3 s | 0.92x |
-| Weight sync | 11.6 s | 11.7 s | 0.99x |
+| **Total step** | **271 s** | **162 s** | **1.67x** |
+| Rollout | 188 s | 84 s | **2.23x** |
+| Policy train | 51.7 s | 47.1 s | 1.10x |
+| Weight sync | 12.1 s | 12.0 s | 1.00x |
 
-Rollout is 2.51x faster; at ~71% of the step, that gives a **1.68x step speedup**. The mean accepted length was **3.73 tokens**, with 89.0 / 74.7 / 60.6 / 48.3% acceptance at depth 1 / 2 / 3 / 4. Every step has a response cut at 8,192 tokens, so rollout time is set by that longest sequence; its decode speedup (2.52x) matches the rollout speedup.
+Rollout is 2.23x faster; at ~69% of the step, that gives a **1.67x step speedup**. The mean accepted length was **3.65 tokens**, with 87.8 / 72.4 / 58.2 / 46.1% acceptance at depth 1 / 2 / 3 / 4. Every step has a response cut at 8,192 tokens, so rollout time is set by that longest sequence; its decode speedup (2.24x) matches the rollout speedup.
 
-**No effect on policy training.** Reward and the rollout/trainer log-prob gap are similar in both arms (one run each, over steps 2-5): 0.24 vs 0.29 raw reward, 0.067 vs 0.072 mean |log-prob diff|.
+**No effect on policy training.** Policy train time varies by about ±10 s between runs at these steps. Reward and the rollout/trainer log-prob gap are similar in both arms (one run each, over steps 2-5): 0.22 vs 0.22 raw reward, 0.069 vs 0.069 mean |log-prob diff|.
 
 ## What's Next
 

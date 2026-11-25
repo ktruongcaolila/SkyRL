@@ -40,16 +40,12 @@ bash examples/train/spec_decode/run_search_megatron_mimo_7b_specdecode.sh
 `run_megatron_dapo_glm5.3_specdecode.sh` trains GLM-5.3 (753B, 256 routed experts per layer) with k=4 MTP drafts on 8 nodes of 8×B200. It is not colocated, because neither side fits a smaller footprint:
 
 - **6 trainer nodes** (Megatron TP1 / CP16 / PP3 / EP16, DeepEP, host AdamW). bf16 weights and grads are ~3 TB, ~100 GB per GPU at this layout. At 4 nodes (EP8) model init runs out of memory.
-- **2 inference nodes**, one vLLM engine per node (DP8 × EP8). NVFP4 routed experts and an NVFP4 KV cache make a whole engine fit in one node (87 GiB of weights per GPU, ~1.1M KV tokens per rank). With two engines, each of the 16 DP ranks decodes 16 sequences per step, where MTP helps most.
+- **2 inference nodes**, one vLLM engine per node (DP8 × EP8). NVFP4 routed experts and an NVFP4 KV cache make a whole engine fit in one node (86–87 GiB of weights per GPU, 1.3–1.6M KV tokens per rank). With two engines, each of the 16 DP ranks decodes 16 sequences per step, where MTP helps most.
 - Weights move over `sharded_rdt`; the MTP drafter rides the target's sessions.
 
 **Ray cluster.** Start Ray on all 8 nodes and launch from the head node, as in the [installation docs](https://docs.skyrl.ai/docs/getting-started/installation). Set `RAY_RUNTIME_ENV_HOOK=ray._private.runtime_env.uv_runtime_env_hook.hook` so every worker re-runs `uv run`.
 
-Settings SkyRL does not forward to the workers are set in the script itself:
-- the vLLM KV-offload and DSA-indexer settings;
-- DeepEP over EFA between the trainer nodes.
-
-The script writes them to an env file next to itself and passes it with `uv run --env-file`. Ray replays that on every worker, so keep the checkout at the same path on every node (a shared checkout). Add your NCCL / EFA settings, `WANDB_API_KEY` and `HF_TOKEN` with `EXTRA_ENV_FILE=/path/to/.env`. The checkpoint and data must also be at the same path on every node.
+The one setting SkyRL does not forward to the workers is set in the script itself: DeepEP's NVSHMEM transport between the trainer nodes on EFA (leave it out on InfiniBand). The script writes it to an env file next to itself and passes it with `uv run --env-file`. Ray replays that on every worker, so keep the checkout at the same path on every node (a shared checkout). Add your NCCL / EFA settings, `WANDB_API_KEY` and `HF_TOKEN` with `EXTRA_ENV_FILE=/path/to/.env`. The checkpoint and data must also be at the same path on every node.
 
 ```bash
 bash examples/train/algorithms/dapo/prepare_dapo_data.sh
@@ -61,14 +57,14 @@ MTP_ENABLED=false bash examples/train/spec_decode/run_megatron_dapo_glm5.3_specd
 
 | Phase | Baseline | MTP | Speedup |
 |---|---:|---:|---:|
-| **Total step** | **287 s** | **170 s** | **1.68x** |
-| Rollout | 205 s | 81 s | **2.51x** |
-| Policy train | 53.4 s | 58.3 s | 0.92x |
-| Weight sync | 11.6 s | 11.7 s | 0.99x |
+| **Total step** | **271 s** | **162 s** | **1.67x** |
+| Rollout | 188 s | 84 s | **2.23x** |
+| Policy train | 51.7 s | 47.1 s | 1.10x |
+| Weight sync | 12.1 s | 12.0 s | 1.00x |
 
-Mean acceptance length was **3.73 tokens**, with 89.0 / 74.7 / 60.6 / 48.3% acceptance at depth 1 / 2 / 3 / 4.
+Mean acceptance length was **3.65 tokens**, with 87.8 / 72.4 / 58.2 / 46.1% acceptance at depth 1 / 2 / 3 / 4. Policy train time varies by about ±10 s between runs at these steps; the draft loss adds little.
 
-Reward and the rollout/trainer log-prob gap are similar in both arms (one run each, over steps 2-5): 0.24 vs 0.29 raw reward, 0.067 vs 0.072 mean |log-prob diff|.
+Reward and the rollout/trainer log-prob gap are similar in both arms (one run each, over steps 2-5): 0.22 vs 0.22 raw reward, 0.069 vs 0.069 mean |log-prob diff|.
 
 ## Monitoring acceptance
 
