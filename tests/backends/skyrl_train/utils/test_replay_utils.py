@@ -156,6 +156,46 @@ def test_setup_replay_installs_indices_and_returns_model_mask(monkeypatch, paral
     assert routed_layer_counts == [1]
 
 
+def test_replay_setup_leaves_mtp_routers_alone(monkeypatch, parallel_state):
+    """Replay installs routes and actions on the trunk's routers only; an MTP head's router keeps routing itself."""
+    trunk_routers = [_Replay(), _Replay()]
+    mtp_router = _Replay(is_mtp_layer=True)
+    RouterReplayAction = _install_router_replay(monkeypatch, [*trunk_routers, mtp_router])
+    monkeypatch.setattr(replay_utils, "_get_current_pp_stage_layer_range", lambda model_config: (0, 2))
+    monkeypatch.setattr(
+        replay_utils,
+        "scatter_router_padding_mask_for_model",
+        lambda mask, model, model_config: mask,
+    )
+
+    # Two captured layers, one per trunk router. vLLM captures no route for the MTP head.
+    routes = torch.tensor([[[[1, 2], [11, 12]], [[3, 4], [13, 14]], [[5, 6], [15, 16]]]], dtype=torch.int16)
+    attention_mask = torch.ones((1, 3), dtype=torch.long)
+    metadata_layout = build_token_metadata_layout(attention_mask, routes.device, packed=False, fp8_enabled=False)
+
+    replay_utils.setup_per_microbatch_replay_forward(
+        _pack_routes(routes, attention_mask),
+        torch.zeros((1, 3), dtype=torch.bool),
+        attention_mask,
+        model=object(),
+        model_config=SimpleNamespace(fp8=None),
+        metadata_layout=metadata_layout,
+    )
+
+    assert [router.target_topk_idx.tolist() for router in trunk_routers] == [
+        [[1, 2], [3, 4], [5, 6]],
+        [[11, 12], [13, 14], [15, 16]],
+    ]
+    assert [router.router_replay_action for router in trunk_routers] == [RouterReplayAction.REPLAY_FORWARD] * 2
+    assert mtp_router.target_topk_idx is None
+    assert mtp_router.router_replay_action is None
+
+    replay_utils.setup_per_microbatch_replay_backward()
+
+    assert [router.router_replay_action for router in trunk_routers] == [RouterReplayAction.REPLAY_BACKWARD] * 2
+    assert mtp_router.router_replay_action is None
+
+
 @pytest.mark.parametrize("packed", [False, True])
 @pytest.mark.parametrize("tp_size", [1, 2])
 def test_replay_indices_are_dtype_independent(monkeypatch, parallel_state, packed, tp_size):
